@@ -1,15 +1,15 @@
 package gate
 
 import (
+	"math"
 	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
-type tokenBucket struct {
-	tokens     float64
-	capacity   float64
-	refillRate float64 // tokens per second
-	lastRefill time.Time
+type tenantBucket struct {
+	limiter    *rate.Limiter
 	lastAccess time.Time
 }
 
@@ -17,7 +17,7 @@ type tokenBucket struct {
 type TokenBucketLimiter struct {
 	mu      sync.Mutex
 	cfg     RateLimitConfig
-	buckets map[string]*tokenBucket
+	buckets map[string]*tenantBucket
 }
 
 // NewTokenBucketLimiter creates a TokenBucketLimiter with the specified configuration.
@@ -33,7 +33,7 @@ func NewTokenBucketLimiter(cfg RateLimitConfig) *TokenBucketLimiter {
 	}
 	return &TokenBucketLimiter{
 		cfg:     cfg,
-		buckets: make(map[string]*tokenBucket),
+		buckets: make(map[string]*tenantBucket),
 	}
 }
 
@@ -50,45 +50,26 @@ func (l *TokenBucketLimiter) Take(tenantKey string, now time.Time) (bool, time.D
 
 	b, exists := l.buckets[tenantKey]
 	if !exists {
-		b = &tokenBucket{
-			tokens:     l.cfg.Burst,
-			capacity:   l.cfg.Burst,
-			refillRate: l.cfg.RequestsPerSecond,
-			lastRefill: now,
+		b = &tenantBucket{
+			limiter:    rate.NewLimiter(rate.Limit(l.cfg.RequestsPerSecond), int(math.Ceil(l.cfg.Burst))),
 			lastAccess: now,
 		}
 		l.buckets[tenantKey] = b
 	}
-
-	// Refill tokens based on elapsed wall time
-	if !b.lastRefill.IsZero() {
-		elapsed := now.Sub(b.lastRefill).Seconds()
-		if elapsed > 0 {
-			b.tokens += elapsed * b.refillRate
-			if b.tokens > b.capacity {
-				b.tokens = b.capacity
-			}
-			b.lastRefill = now
-		}
-	} else {
-		b.lastRefill = now
-	}
 	b.lastAccess = now
 
-	if b.tokens >= 1.0 {
-		b.tokens -= 1.0
-		return true, 0, b.tokens
+	r := b.limiter.ReserveN(now, 1)
+	if !r.OK() {
+		return false, time.Hour, b.limiter.TokensAt(now)
 	}
 
-	// Rate limit exceeded; calculate retry-after duration
-	deficit := 1.0 - b.tokens
-	waitSec := deficit / b.refillRate
-	retryAfter := time.Duration(waitSec * float64(time.Second))
-	if retryAfter < time.Millisecond {
-		retryAfter = time.Millisecond
+	delay := r.DelayFrom(now)
+	if delay == 0 {
+		return true, 0, b.limiter.TokensAt(now)
 	}
 
-	return false, retryAfter, b.tokens
+	r.CancelAt(now)
+	return false, delay, b.limiter.TokensAt(now)
 }
 
 // SweepIdle evicts tenant buckets that have been inactive longer than IdleTTL.

@@ -11,6 +11,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type bufferedResponse struct {
@@ -29,6 +32,9 @@ type Gateway struct {
 	requestsTotal    atomic.Uint64
 	coalescedTotal   atomic.Uint64
 	rateLimitedTotal atomic.Uint64
+
+	promHandler  http.Handler
+	circuitGauge *prometheus.GaugeVec
 }
 
 // NewGateway creates and initializes a Gateway with the specified configuration.
@@ -40,12 +46,52 @@ func NewGateway(cfg Config) *Gateway {
 		cfg.MaxBodyBytes = 10 * 1024 * 1024
 	}
 
-	return &Gateway{
+	g := &Gateway{
 		cfg:          cfg,
 		rateLimiter:  NewTokenBucketLimiter(cfg.RateLimit),
 		singleFlight: NewGroup(),
 		failover:     NewFailoverRouter(cfg.Providers, cfg.Breaker, cfg.MaxBodyBytes),
 	}
+
+	reg := prometheus.NewRegistry()
+
+	reqCounter := prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "aigate_requests_total",
+		Help: "Total number of processed requests",
+	}, func() float64 {
+		return float64(g.requestsTotal.Load())
+	})
+
+	coalescedCounter := prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "aigate_coalesced_total",
+		Help: "Total number of requests coalesced via Single-Flight",
+	}, func() float64 {
+		return float64(g.coalescedTotal.Load())
+	})
+
+	rateLimitedCounter := prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "aigate_rate_limited_total",
+		Help: "Total number of rate-limited requests",
+	}, func() float64 {
+		return float64(g.rateLimitedTotal.Load())
+	})
+
+	failoverCounter := prometheus.NewCounterFunc(prometheus.CounterOpts{
+		Name: "aigate_failover_total",
+		Help: "Total number of provider failover attempts",
+	}, func() float64 {
+		return float64(g.failover.FailoverCount())
+	})
+
+	g.circuitGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "aigate_circuit_state",
+		Help: "Upstream circuit breaker state (0=Closed, 1=HalfOpen, 2=Open)",
+	}, []string{"provider"})
+
+	reg.MustRegister(reqCounter, coalescedCounter, rateLimitedCounter, failoverCounter, g.circuitGauge)
+	g.promHandler = promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
+
+	return g
 }
 
 // RateLimiter returns the gateway's token bucket rate limiter.
@@ -193,9 +239,14 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if req.URL.Path == "/metrics" {
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		g.writeMetrics(w)
+		for _, p := range g.failover.Providers() {
+			state := 0
+			if b := g.failover.GetProviderBreaker(p.Name); b != nil {
+				state = int(b.State())
+			}
+			g.circuitGauge.WithLabelValues(p.Name).Set(float64(state))
+		}
+		g.promHandler.ServeHTTP(w, req)
 		return
 	}
 
@@ -223,32 +274,4 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 	_ = resp.Body.Close()
-}
-
-func (g *Gateway) writeMetrics(w io.Writer) {
-	fmt.Fprintf(w, "# HELP aigate_requests_total Total number of processed requests\n")
-	fmt.Fprintf(w, "# TYPE aigate_requests_total counter\n")
-	fmt.Fprintf(w, "aigate_requests_total %d\n", g.requestsTotal.Load())
-
-	fmt.Fprintf(w, "# HELP aigate_coalesced_total Total number of requests coalesced via Single-Flight\n")
-	fmt.Fprintf(w, "# TYPE aigate_coalesced_total counter\n")
-	fmt.Fprintf(w, "aigate_coalesced_total %d\n", g.coalescedTotal.Load())
-
-	fmt.Fprintf(w, "# HELP aigate_rate_limited_total Total number of rate-limited requests\n")
-	fmt.Fprintf(w, "# TYPE aigate_rate_limited_total counter\n")
-	fmt.Fprintf(w, "aigate_rate_limited_total %d\n", g.rateLimitedTotal.Load())
-
-	fmt.Fprintf(w, "# HELP aigate_failover_total Total number of provider failover attempts\n")
-	fmt.Fprintf(w, "# TYPE aigate_failover_total counter\n")
-	fmt.Fprintf(w, "aigate_failover_total %d\n", g.failover.FailoverCount())
-
-	fmt.Fprintf(w, "# HELP aigate_circuit_state Upstream circuit breaker state (0=Closed, 1=HalfOpen, 2=Open)\n")
-	fmt.Fprintf(w, "# TYPE aigate_circuit_state gauge\n")
-	for _, p := range g.failover.Providers() {
-		state := 0
-		if b := g.failover.GetProviderBreaker(p.Name); b != nil {
-			state = int(b.State())
-		}
-		fmt.Fprintf(w, "aigate_circuit_state{provider=%q} %d\n", p.Name, state)
-	}
 }

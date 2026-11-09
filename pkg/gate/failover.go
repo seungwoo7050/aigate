@@ -2,13 +2,13 @@ package gate
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"sort"
+	"slices"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -37,8 +37,8 @@ func NewFailoverRouter(providers []ProviderConfig, breakerCfg BreakerConfig, max
 	// Sort providers in ascending order of Priority (1 is primary)
 	sorted := make([]ProviderConfig, len(providers))
 	copy(sorted, providers)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].Priority < sorted[j].Priority
+	slices.SortFunc(sorted, func(a, b ProviderConfig) int {
+		return cmp.Compare(a.Priority, b.Priority)
 	})
 
 	upstreams := make([]*upstreamProvider, len(sorted))
@@ -142,7 +142,9 @@ func (r *FailoverRouter) RoundTrip(req *http.Request) (*http.Response, error) {
 				outReq.URL.Host = baseURL.Host
 				outReq.Host = baseURL.Host
 				if baseURL.Path != "" && baseURL.Path != "/" {
-					outReq.URL.Path = singleJoiningSlash(baseURL.Path, outReq.URL.Path)
+					if joined, joinErr := url.JoinPath(baseURL.Path, outReq.URL.Path); joinErr == nil {
+						outReq.URL.Path = joined
+					}
 				}
 			}
 		}
@@ -206,16 +208,4 @@ type httpError struct {
 
 func (e *httpError) Error() string {
 	return "upstream error: " + e.status
-}
-
-func singleJoiningSlash(a, b string) string {
-	aslash := strings.HasSuffix(a, "/")
-	bslash := strings.HasPrefix(b, "/")
-	switch {
-	case aslash && bslash:
-		return a + b[1:]
-	case !aslash && !bslash:
-		return a + "/" + b
-	}
-	return a + b
 }

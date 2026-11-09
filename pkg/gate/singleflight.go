@@ -4,8 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"sync"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // Result holds the return value of a coalesced call.
@@ -15,30 +16,25 @@ type Result struct {
 	Shared bool
 }
 
-// call represents an in-flight or completed single-flight execution.
-type call struct {
-	key        string
-	val        any
-	err        error
-	done       chan struct{}
-	cancelExec context.CancelFunc // Cancels upstream execution context when all subscribers cancel
-
-	mu          sync.Mutex
-	subscribers int // Number of active waiting callers
+type callState struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+	res    singleflight.Result
+	mu     sync.Mutex
+	subs   int
 }
 
 // Group represents a single-flight group that isolates caller context cancellations.
-// Unlike standard singleflight, cancelling the first caller's context will NOT abort the
-// upstream call as long as at least one waiting caller's context remains active.
 type Group struct {
+	sfg   singleflight.Group
 	mu    sync.Mutex
-	calls map[string]*call
+	calls map[string]*callState
 }
 
 // NewGroup creates an initialized single-flight group.
 func NewGroup() *Group {
 	return &Group{
-		calls: make(map[string]*call),
+		calls: make(map[string]*callState),
 	}
 }
 
@@ -50,99 +46,70 @@ func RequestKey(method, path string, body []byte) string {
 }
 
 // Do executes and returns the results of the given function, making sure that only one execution
-// is in-flight for a given key at a time. If a duplicate comes in, the duplicate caller waits for the
-// original to complete and receives the same results.
-//
-// If the original (leader) caller's context is cancelled, the upstream execution continues unharmed
-// using context.WithoutCancel as long as there is at least one active follower context.
-// The upstream execution is cancelled if and only if ALL active subscribers cancel their contexts.
+// is in-flight for a given key at a time.
 func (g *Group) Do(ctx context.Context, key string, fn func(execCtx context.Context) (any, error)) (any, error, bool) {
 	if ctx.Err() != nil {
 		return nil, ctx.Err(), false
 	}
 
 	g.mu.Lock()
-	if c, ok := g.calls[key]; ok {
-		c.mu.Lock()
-		if c.subscribers > 0 {
-			c.subscribers++
-			c.mu.Unlock()
+	st, ok := g.calls[key]
+	if ok {
+		st.mu.Lock()
+		if st.subs > 0 {
+			st.subs++
+			st.mu.Unlock()
 			g.mu.Unlock()
-
-			// Waiting follower
-			select {
-			case <-c.done:
-				return c.val, c.err, true
-			case <-ctx.Done():
-				c.mu.Lock()
-				c.subscribers--
-				shouldCancel := (c.subscribers <= 0)
-				c.mu.Unlock()
-				if shouldCancel && c.cancelExec != nil {
-					c.cancelExec()
-				}
-				return nil, ctx.Err(), true
-			}
+			return g.wait(ctx, key, st, true)
 		}
-		// Previous subscribers all cancelled and abandoned the call; purge it
+		st.mu.Unlock()
 		delete(g.calls, key)
-		c.mu.Unlock()
+		g.sfg.Forget(key)
 	}
 
-	// Caller is the leader
-	execCtx, cancelExec := context.WithCancel(context.WithoutCancel(ctx))
-	c := &call{
-		key:         key,
-		done:        make(chan struct{}),
-		cancelExec:  cancelExec,
-		subscribers: 1,
+	execCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	st = &callState{
+		cancel: cancel,
+		done:   make(chan struct{}),
+		subs:   1,
 	}
-	g.calls[key] = c
+	g.calls[key] = st
 	g.mu.Unlock()
 
-	go func() {
-		var (
-			panicVal any
-			val      any
-			err      error
-		)
-
+	g.sfg.DoChan(key, func() (any, error) {
+		var val any
+		var err error
 		defer func() {
-			if r := recover(); r != nil {
-				panicVal = r
-			}
-
-			c.mu.Lock()
-			c.val = val
-			if panicVal != nil {
-				c.err = fmt.Errorf("singleflight panic: %v", panicVal)
-			} else {
-				c.err = err
-			}
-			c.mu.Unlock()
-
+			st.res = singleflight.Result{Val: val, Err: err}
+			close(st.done)
 			g.mu.Lock()
 			delete(g.calls, key)
 			g.mu.Unlock()
-
-			close(c.done)
 		}()
-
 		val, err = fn(execCtx)
-	}()
+		return val, err
+	})
 
+	return g.wait(ctx, key, st, false)
+}
+
+func (g *Group) wait(ctx context.Context, key string, st *callState, isFollower bool) (any, error, bool) {
 	select {
-	case <-c.done:
-		return c.val, c.err, false
+	case <-st.done:
+		return st.res.Val, st.res.Err, isFollower
 	case <-ctx.Done():
-		c.mu.Lock()
-		c.subscribers--
-		shouldCancel := (c.subscribers <= 0)
-		c.mu.Unlock()
-		if shouldCancel && c.cancelExec != nil {
-			c.cancelExec()
+		st.mu.Lock()
+		st.subs--
+		shouldCancel := (st.subs <= 0)
+		st.mu.Unlock()
+		if shouldCancel {
+			st.cancel()
+			g.mu.Lock()
+			delete(g.calls, key)
+			g.mu.Unlock()
+			g.sfg.Forget(key)
 		}
-		return nil, ctx.Err(), false
+		return nil, ctx.Err(), isFollower
 	}
 }
 
@@ -151,4 +118,5 @@ func (g *Group) Forget(key string) {
 	g.mu.Lock()
 	delete(g.calls, key)
 	g.mu.Unlock()
+	g.sfg.Forget(key)
 }

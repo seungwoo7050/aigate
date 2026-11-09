@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/woopinbell/aigate/pkg/gate"
+	"github.com/seungwoo7050/aigate/pkg/gate"
 )
 
 func main() {
@@ -73,8 +73,8 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	go func() {
 		log.Printf("[aigate] Starting resilience gateway on %s", *listenAddr)
@@ -86,7 +86,7 @@ func main() {
 		}
 	}()
 
-	<-stop
+	<-ctx.Done()
 	log.Println("[aigate] Shutting down server gracefully...")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

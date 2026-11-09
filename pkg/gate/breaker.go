@@ -1,8 +1,11 @@
 package gate
 
 import (
+	"errors"
 	"sync"
 	"time"
+
+	"github.com/sony/gobreaker/v2"
 )
 
 // State represents the operational state of a circuit breaker.
@@ -31,16 +34,13 @@ func (s State) String() string {
 	}
 }
 
-// CircuitBreaker implements a 3-state circuit breaker with strict probe concurrency gating in Half-Open state.
+// CircuitBreaker wraps gobreaker.TwoStepCircuitBreaker with probe concurrency gating and wall-clock cooldown support.
 type CircuitBreaker struct {
-	mu sync.Mutex
-
-	state                State
-	consecutiveFailures  int
-	openedAt             time.Time
-	halfOpenProbesActive int
-
-	cfg BreakerConfig
+	mu       sync.Mutex
+	cfg      BreakerConfig
+	cb       *gobreaker.TwoStepCircuitBreaker[any]
+	openedAt time.Time
+	lastNow  time.Time
 }
 
 // NewCircuitBreaker creates a new CircuitBreaker with the given configuration.
@@ -54,10 +54,28 @@ func NewCircuitBreaker(cfg BreakerConfig) *CircuitBreaker {
 	if cfg.MaxHalfOpenProbes <= 0 {
 		cfg.MaxHalfOpenProbes = 1
 	}
-	return &CircuitBreaker{
-		state: StateClosed,
-		cfg:   cfg,
+	cb := &CircuitBreaker{cfg: cfg}
+	cb.init()
+	return cb
+}
+
+func (cb *CircuitBreaker) init() {
+	st := gobreaker.Settings{
+		MaxRequests: uint32(cb.cfg.MaxHalfOpenProbes),
+		Timeout:     time.Nanosecond, // Cooldown gating is handled via wall-clock now parameter
+		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			return counts.ConsecutiveFailures >= uint32(cb.cfg.FailureThreshold)
+		},
+		OnStateChange: func(name string, from, to gobreaker.State) {
+			if to == gobreaker.StateOpen {
+				cb.openedAt = cb.lastNow
+			} else if to == gobreaker.StateClosed {
+				cb.openedAt = time.Time{}
+			}
+		},
 	}
+	cb.cb = gobreaker.NewTwoStepCircuitBreaker[any](st)
+	cb.openedAt = time.Time{}
 }
 
 // Allow evaluates whether a request may proceed based on the breaker's current state and wall-clock time.
@@ -67,82 +85,31 @@ func (cb *CircuitBreaker) Allow(now time.Time) (bool, func(success bool)) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
-	// 1. If Open, check if cooldown has elapsed to transition to Half-Open
-	if cb.state == StateOpen {
-		if !cb.openedAt.IsZero() && now.Sub(cb.openedAt) >= cb.cfg.Cooldown {
-			cb.state = StateHalfOpen
-			cb.halfOpenProbesActive = 0
-		} else {
-			return false, nil
-		}
-	}
+	cb.lastNow = now
 
-	// 2. If Half-Open, strictly gate concurrent probe requests to MaxHalfOpenProbes
-	if cb.state == StateHalfOpen {
-		if cb.halfOpenProbesActive < cb.cfg.MaxHalfOpenProbes {
-			cb.halfOpenProbesActive++
-			var once sync.Once
-			return true, func(success bool) {
-				once.Do(func() {
-					cb.onProbeResult(success, time.Now())
-				})
-			}
-		}
-		// Probe quota saturated; fast fail concurrent requests
+	// 1. If Open and still within Cooldown period, fast-fail
+	if !cb.openedAt.IsZero() && now.Sub(cb.openedAt) < cb.cfg.Cooldown {
 		return false, nil
 	}
 
-	// 3. State is Closed; normal operation
+	// 2. Delegate to underlying gobreaker engine
+	done, err := cb.cb.Allow()
+	if err != nil {
+		return false, nil
+	}
+
 	var once sync.Once
 	return true, func(success bool) {
 		once.Do(func() {
-			cb.onClosedResult(success, time.Now())
+			cb.mu.Lock()
+			defer cb.mu.Unlock()
+			cb.lastNow = time.Now()
+			if success {
+				done(nil)
+			} else {
+				done(errors.New("request failed"))
+			}
 		})
-	}
-}
-
-func (cb *CircuitBreaker) onClosedResult(success bool, now time.Time) {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-
-	if cb.state != StateClosed {
-		return
-	}
-
-	if success {
-		cb.consecutiveFailures = 0
-	} else {
-		cb.consecutiveFailures++
-		if cb.consecutiveFailures >= cb.cfg.FailureThreshold {
-			cb.state = StateOpen
-			cb.openedAt = now
-			cb.halfOpenProbesActive = 0
-		}
-	}
-}
-
-func (cb *CircuitBreaker) onProbeResult(success bool, now time.Time) {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-
-	if cb.halfOpenProbesActive > 0 {
-		cb.halfOpenProbesActive--
-	}
-
-	if cb.state != StateHalfOpen {
-		return
-	}
-
-	if success {
-		// Probe succeeded: recover to Closed
-		cb.state = StateClosed
-		cb.consecutiveFailures = 0
-		cb.halfOpenProbesActive = 0
-	} else {
-		// Probe failed: trip back to Open for another Cooldown cycle
-		cb.state = StateOpen
-		cb.openedAt = now
-		cb.halfOpenProbesActive = 0
 	}
 }
 
@@ -151,11 +118,13 @@ func (cb *CircuitBreaker) State() State {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
-	if cb.state == StateOpen && !cb.openedAt.IsZero() && time.Since(cb.openedAt) >= cb.cfg.Cooldown {
-		cb.state = StateHalfOpen
-		cb.halfOpenProbesActive = 0
+	if !cb.openedAt.IsZero() {
+		if time.Since(cb.openedAt) < cb.cfg.Cooldown {
+			return StateOpen
+		}
+		return StateHalfOpen
 	}
-	return cb.state
+	return State(cb.cb.State())
 }
 
 // Reset restores the breaker to StateClosed and clears failure counters.
@@ -163,10 +132,7 @@ func (cb *CircuitBreaker) Reset() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
-	cb.state = StateClosed
-	cb.consecutiveFailures = 0
-	cb.halfOpenProbesActive = 0
-	cb.openedAt = time.Time{}
+	cb.init()
 }
 
 // Trip forces the breaker into StateOpen immediately (useful for manual intervention or testing).
@@ -174,7 +140,12 @@ func (cb *CircuitBreaker) Trip(now time.Time) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
-	cb.state = StateOpen
+	cb.lastNow = now
 	cb.openedAt = now
-	cb.halfOpenProbesActive = 0
+	for i := 0; i < cb.cfg.FailureThreshold; i++ {
+		done, err := cb.cb.Allow()
+		if err == nil {
+			done(errors.New("trip"))
+		}
+	}
 }

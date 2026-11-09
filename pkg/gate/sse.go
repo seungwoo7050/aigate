@@ -1,27 +1,21 @@
 package gate
 
 import (
-	"bytes"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/tidwall/gjson"
 )
 
 // IsSSERequest checks if an incoming HTTP request requests Server-Sent Events streaming,
 // either via the Accept header or JSON body containing `"stream": true`.
 func IsSSERequest(req *http.Request, body []byte) bool {
-	accept := req.Header.Get("Accept")
-	if strings.Contains(strings.ToLower(accept), "text/event-stream") {
+	if strings.Contains(strings.ToLower(req.Header.Get("Accept")), "text/event-stream") {
 		return true
 	}
-	if len(body) > 0 {
-		lowerBody := bytes.ToLower(body)
-		if bytes.Contains(lowerBody, []byte(`"stream":true`)) || bytes.Contains(lowerBody, []byte(`"stream": true`)) {
-			return true
-		}
-	}
-	return false
+	return len(body) > 0 && gjson.GetBytes(body, "stream").Bool()
 }
 
 // IsSSEResponse checks if an upstream HTTP response is a Server-Sent Events stream.
@@ -29,8 +23,7 @@ func IsSSEResponse(resp *http.Response) bool {
 	if resp == nil {
 		return false
 	}
-	contentType := resp.Header.Get("Content-Type")
-	return strings.Contains(strings.ToLower(contentType), "text/event-stream")
+	return strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
 }
 
 // ProxyStream streams Server-Sent Events from the upstream response to the downstream ResponseWriter
